@@ -232,4 +232,4 @@ For support and questions:
 
 ---
 
-**InfoFlow AI** - Empowering enterprises with intelligent knowledge management through advanced RAG technology.
+**InfoFlow AI** - Empowering enterprises with intelligent knowledge management through advanced RAG technology."# InflowAI" 
