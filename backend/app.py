@@ -4,6 +4,8 @@ import hashlib
 import logging
 import sqlite3
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -11,7 +13,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from openai import OpenAI
-from openai import APIConnectionError, AuthenticationError
+from openai import APIConnectionError, AuthenticationError, OpenAIError, RateLimitError
 import faiss
 import numpy as np
 from pypdf import PdfReader
@@ -41,13 +43,22 @@ def iso_now():
 
 
 def default_config():
+    provider = os.getenv("LLM_PROVIDER", "ollama").lower()
     return {
+        "llm_provider": provider,
+        "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
+        "ollama_chat_model": os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:3b"),
+        "ollama_embedding_model": os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
         "openai_model": os.getenv("OPENAI_MODEL", "gpt-4"),
         "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
         "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "2000")),
         "chunk_size": int(os.getenv("CHUNK_SIZE", "1000")),
         "chunk_overlap": int(os.getenv("CHUNK_OVERLAP", "200")),
-        "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002"),
+        "embedding_model": (
+            os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+            if provider == "ollama"
+            else os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+        ),
         "vector_db_type": os.getenv("VECTOR_DB_TYPE", "faiss"),
         "max_file_size": int(os.getenv("MAX_FILE_SIZE", "10485760")),
     }
@@ -57,10 +68,45 @@ def load_runtime_config():
     config = default_config()
     if CONFIG_PATH.exists():
         try:
-            config.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if "llm_provider" not in stored:
+                stored["llm_provider"] = config["llm_provider"]
+                if config["llm_provider"] == "ollama":
+                    stored["embedding_model"] = config["embedding_model"]
+            config.update(stored)
         except Exception as exc:
             logger.warning("Could not read runtime config: %s", exc)
+    if config["llm_provider"] not in ("openai", "ollama"):
+        logger.warning("Unknown LLM provider %s; defaulting to Ollama", config["llm_provider"])
+        config["llm_provider"] = "ollama"
+    if config["llm_provider"] == "ollama":
+        config["embedding_model"] = config.get("embedding_model") or config["ollama_embedding_model"]
     return config
+
+
+def ollama_request(endpoint, payload=None, timeout=300):
+    url = f"{runtime_config['ollama_base_url']}/api/{endpoint.lstrip('/')}"
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"} if body is not None else {},
+        method="POST" if body is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error", str(exc))
+        except Exception:
+            detail = str(exc)
+        raise RuntimeError(f"Ollama request failed: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(
+            "Cannot connect to Ollama. Install and start Ollama, then ensure it is available at "
+            f"{runtime_config['ollama_base_url']}."
+        ) from exc
 
 
 runtime_config = load_runtime_config()
@@ -188,14 +234,23 @@ class RAGStore:
     def embed_texts(self, texts):
         if not texts:
             return []
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is not configured")
-        client = self.openai_client()
-        response = client.embeddings.create(
-            model=runtime_config["embedding_model"],
-            input=texts,
-        )
-        vectors = [item.embedding for item in response.data]
+        if runtime_config["llm_provider"] == "ollama":
+            response = ollama_request("embed", {
+                "model": runtime_config["embedding_model"],
+                "input": texts,
+            })
+            vectors = response.get("embeddings", [])
+            if len(vectors) != len(texts):
+                raise RuntimeError("Ollama returned an unexpected number of embeddings.")
+        else:
+            if not os.getenv("OPENAI_API_KEY"):
+                raise RuntimeError("OPENAI_API_KEY is not configured")
+            client = self.openai_client()
+            response = client.embeddings.create(
+                model=runtime_config["embedding_model"],
+                input=texts,
+            )
+            vectors = [item.embedding for item in response.data]
         return self.normalize_embeddings(vectors).tolist()
 
     def embed_query(self, text):
@@ -344,18 +399,73 @@ def file_sha256(file_path):
     return digest.hexdigest()
 
 
+def process_document(file_path, document_id=None, source_name=None):
+    name = source_name or file_path.name
+    pages = extract_text(file_path)
+    if not pages:
+        raise ValueError("The document contains no extractable text.")
+    chunks = chunk_text(pages, name)
+    if not chunks:
+        raise ValueError("The document produced no text chunks.")
+    rag_store.add_chunks(chunks)
+    if document_id:
+        db.update_document(document_id, "ready", len(chunks), None, iso_now())
+    return len(chunks)
+
+
 def openai_api_connection():
     if not os.getenv("OPENAI_API_KEY"):
         return False, "API key not configured"
     try:
         OpenAI(api_key=os.getenv("OPENAI_API_KEY")).models.list()
-        return True, "Connected"
+        return True, "Key accepted; credits are checked when used"
     except AuthenticationError:
         return False, "Invalid API key"
     except APIConnectionError:
         return False, "Connection failed"
     except Exception as exc:
+        logger.warning("OpenAI connectivity check failed: %s", exc)
+        return False, "OpenAI connectivity check failed"
+
+
+def provider_connection():
+    if runtime_config["llm_provider"] == "openai":
+        return openai_api_connection()
+    try:
+        response = ollama_request("tags", timeout=5)
+        installed = {model.get("name") for model in response.get("models", [])}
+        required = {
+            runtime_config["ollama_chat_model"],
+            runtime_config["embedding_model"],
+        }
+        missing = sorted(
+            model for model in required
+            if model not in installed and f"{model}:latest" not in installed
+        )
+        if missing:
+            return False, f"Pull required Ollama model(s): {', '.join(missing)}"
+        return True, "Ollama connected; local models available"
+    except Exception as exc:
         return False, str(exc)
+
+
+def provider_error_message(error):
+    detail = str(error).lower()
+    if "insufficient_quota" in detail or "credit_balance_exhausted" in detail or "no credits remaining" in detail:
+        return "OpenAI API credits are exhausted. Add billing or use an API key with available credits, then retry this upload."
+    if isinstance(error, RateLimitError):
+        return "OpenAI rate limit reached. Wait briefly and try again."
+    if isinstance(error, AuthenticationError):
+        return "OpenAI rejected the API key. Check the key in backend\\.env or Settings."
+    if isinstance(error, APIConnectionError):
+        return "Could not connect to OpenAI. Check your internet connection and retry."
+    if isinstance(error, OpenAIError):
+        logger.error("OpenAI request failed: %s", error)
+        return "OpenAI could not process the request. Check the backend log for details."
+    if "ollama request failed" in detail or "cannot connect to ollama" in detail:
+        return str(error)
+    logger.error("OpenAI or processing request failed: %s", error)
+    return str(error) or "Document processing failed. Check the backend log for details."
 
 
 app = Flask(__name__)
@@ -363,22 +473,42 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 
 def document_payload(document):
+    stored_error = document["error"]
     return {
         "id": str(document["id"]),
         "name": document["name"],
         "type": document["type"].upper(),
         "size": document["size"],
-        "sizeLabel": f"{document['size'] / (1024 * 1024):.1f} MB",
+        "sizeLabel": f"{document['size'] / (1024 * 1024):.2f} MB",
         "uploadDate": document["created_at"],
         "status": document["status"],
         "chunks": document["chunks"],
-        "error": document["error"],
+        "error": provider_error_message(RuntimeError(stored_error)) if stored_error else None,
     }
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "service": "InfoFlow AI Backend",
+        "status": "active",
+        "frontend": "http://localhost:5173",
+        "api_status": "/api/status",
+        "endpoints": [
+            "/api/chat",
+            "/api/upload",
+            "/api/documents",
+            "/api/knowledge",
+            "/api/search",
+            "/api/settings",
+        ],
+        "message": "Open the frontend URL to use InfoFlow AI.",
+    })
 
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    api_connected, api_detail = openai_api_connection()
+    api_connected, api_detail = provider_connection()
     with lock:
         documents = db.list_documents()
         return jsonify({
@@ -435,11 +565,30 @@ def upload_document():
     existing = db.get_by_hash(digest)
     if existing:
         temporary_path.unlink(missing_ok=True)
-        return jsonify({
-            "status": "duplicate",
-            "message": f"{filename} is already in the knowledge base.",
-            "document": document_payload(existing),
-        }), 200
+        if existing["status"] != "error":
+            return jsonify({
+                "status": "duplicate",
+                "message": f"{filename} is already in the knowledge base.",
+                "document": document_payload(existing),
+            }), 200
+        try:
+            with lock:
+                count = process_document(Path(existing["stored_path"]), existing["id"], existing["name"])
+            document = db.get_document(existing["id"])
+            return jsonify({
+                "status": "success",
+                "message": f"Successfully processed {count} chunks from {filename}",
+                "chunks": count,
+                "file_name": filename,
+                "document": document_payload(document),
+            }), 200
+        except Exception as exc:
+            logger.exception("Document retry failed for %s", filename)
+            message = provider_error_message(exc)
+            db.update_document(existing["id"], "error", 0, message, None)
+            document = db.get_document(existing["id"])
+            return jsonify({"status": "error", "error": message, "message": message,
+                            "document": document_payload(document)}), 422
 
     stored_name = f"{digest[:12]}_{filename}"
     stored_path = UPLOAD_DIR / stored_name
@@ -470,12 +619,13 @@ def upload_document():
         }), 200
     except Exception as exc:
         logger.exception("Document processing failed for %s", filename)
-        db.update_document(document_id, "error", 0, str(exc), None)
+        message = provider_error_message(exc)
+        db.update_document(document_id, "error", 0, message, None)
         document = db.get_document(document_id)
         return jsonify({
             "status": "error",
-            "error": str(exc),
-            "message": f"Could not process {filename}: {exc}",
+            "error": message,
+            "message": f"Could not process {filename}: {message}",
             "document": document_payload(document),
         }), 422
 
@@ -520,7 +670,11 @@ def chat():
     try:
         with lock:
             retrieved = rag_store.search(question, k=min(5, len(rag_store.chunks)))
-        relevant = [item for item in retrieved if item["similarity"] >= 0.25]
+        if not retrieved:
+            relevant = []
+        else:
+            relevance_threshold = max(0.52, retrieved[0]["similarity"] - 0.12)
+            relevant = [item for item in retrieved if item["similarity"] >= relevance_threshold]
         if not relevant:
             return jsonify({
                 "status": "success",
@@ -543,17 +697,31 @@ def chat():
             f"Context:\\n{chr(10).join(context_blocks)}\\n\\n"
             f"Question:\\n{question}"
         )
-        client = rag_store.openai_client()
-        response = client.chat.completions.create(
-            model=runtime_config["openai_model"],
-            temperature=float(runtime_config["temperature"]),
-            max_tokens=int(runtime_config["max_tokens"]),
-            messages=[
-                {"role": "system", "content": "You are InfoFlow AI. Ground every answer in the supplied document context."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        answer = response.choices[0].message.content.strip()
+        messages = [
+            {"role": "system", "content": "You are InfoFlow AI. Ground every answer in the supplied document context."},
+            {"role": "user", "content": prompt},
+        ]
+        if runtime_config["llm_provider"] == "ollama":
+            response = ollama_request("chat", {
+                "model": runtime_config["ollama_chat_model"],
+                "stream": False,
+                "messages": messages,
+                "options": {
+                    "temperature": float(runtime_config["temperature"]),
+                    "num_predict": int(runtime_config["max_tokens"]),
+                },
+            })
+            answer = response.get("message", {}).get("content", "").strip()
+            if not answer:
+                raise RuntimeError("Ollama returned an empty answer.")
+        else:
+            response = rag_store.openai_client().chat.completions.create(
+                model=runtime_config["openai_model"],
+                temperature=float(runtime_config["temperature"]),
+                max_tokens=int(runtime_config["max_tokens"]),
+                messages=messages,
+            )
+            answer = response.choices[0].message.content.strip()
         sources = [{
             "content": item["content"][:500],
             "source": item["source"],
@@ -569,7 +737,8 @@ def chat():
         })
     except Exception as exc:
         logger.exception("Chat query failed")
-        return jsonify({"status": "error", "error": str(exc), "message": f"Chat request failed: {exc}"}), 500
+        message = provider_error_message(exc)
+        return jsonify({"status": "error", "error": message, "message": message}), 500
 
 
 @app.route("/api/search", methods=["POST"])
@@ -656,10 +825,16 @@ def export_vector_database():
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
-    api_connected, api_detail = openai_api_connection()
+    api_connected, api_detail = provider_connection()
     public = {
+        "provider": runtime_config["llm_provider"],
         "openaiApiKeySet": bool(os.getenv("OPENAI_API_KEY")),
-        "model": runtime_config["openai_model"],
+        "model": (
+            runtime_config["ollama_chat_model"]
+            if runtime_config["llm_provider"] == "ollama"
+            else runtime_config["openai_model"]
+        ),
+        "ollamaBaseUrl": runtime_config["ollama_base_url"],
         "maxTokens": runtime_config["max_tokens"],
         "temperature": runtime_config["temperature"],
         "chunkSize": runtime_config["chunk_size"],
@@ -682,13 +857,25 @@ def get_settings():
 def save_settings():
     global runtime_config
     data = request.get_json(silent=True) or {}
+    old_provider = runtime_config["llm_provider"]
     old_embedding_model = runtime_config["embedding_model"]
     key = str(data.get("openaiApiKey") or "").strip()
     if key:
         os.environ["OPENAI_API_KEY"] = key
 
+    provider = str(data.get("provider", runtime_config["llm_provider"])).lower()
+    if provider not in ("openai", "ollama"):
+        return jsonify({"error": "Provider must be 'ollama' or 'openai'."}), 400
+    runtime_config["llm_provider"] = provider
+    model = data.get("model")
+    if model is not None:
+        model = str(model).strip()
+        if not model:
+            return jsonify({"error": "Model name cannot be empty."}), 400
+        runtime_config["ollama_chat_model" if provider == "ollama" else "openai_model"] = model
+
     allowed_values = {
-        "openai_model": data.get("model"),
+        "ollama_base_url": data.get("ollamaBaseUrl"),
         "max_tokens": data.get("maxTokens"),
         "temperature": data.get("temperature"),
         "chunk_size": data.get("chunkSize"),
@@ -708,14 +895,17 @@ def save_settings():
     )
 
     CONFIG_PATH.write_text(json.dumps(runtime_config, indent=2), encoding="utf-8")
-    if runtime_config["embedding_model"] != old_embedding_model:
+    if (
+        runtime_config["embedding_model"] != old_embedding_model
+        or runtime_config["llm_provider"] != old_provider
+    ):
         try:
             with lock:
                 rag_store.rebuild_from_chunks(rag_store.chunks)
         except Exception as exc:
             return jsonify({"error": f"Settings saved, but vector reindex failed: {exc}"}), 500
 
-    api_connected, api_detail = openai_api_connection()
+    api_connected, api_detail = provider_connection()
     return jsonify({
         "status": "success",
         "message": "Settings saved.",
@@ -732,19 +922,3 @@ if __name__ == "__main__":
         port=int(os.getenv("API_PORT", "5000")),
         debug=False,
     )
-
-
-def process_document(file_path, document_id=None, source_name=None):
-    name = source_name or file_path.name
-    pages = extract_text(file_path)
-    if not pages:
-        raise ValueError("The document contains no extractable text.")
-    chunks = chunk_text(pages, name)
-    if not chunks:
-        raise ValueError("The document produced no text chunks.")
-    rag_store.add_chunks(chunks)
-    if document_id:
-        db.update_document(
-            document_id, "ready", len(chunks), None, iso_now()
-        )
-    return len(chunks)

@@ -23,6 +23,9 @@ dist-ssr
 *.sln
 *.sw?
 .env
+backend/.env
+backend/data/
+backend/uploads/
 # Python backend
 venv/
 __pycache__/

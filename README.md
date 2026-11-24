@@ -1,235 +1,108 @@
-# InfoFlow AI - Enterprise RAG Chatbot System
+# InfoFlow AI
 
-A comprehensive Retrieval-Augmented Generation (RAG) chatbot system designed for enterprise knowledge management. InfoFlow AI processes multiple document formats, creates intelligent embeddings, and provides accurate responses using OpenAI's GPT-4.
+InfoFlow AI is a document question-answering application that uses a React frontend, a Flask API, FAISS, and either local Ollama models or OpenAI for embeddings and chat.
 
-## 🏗️ System Architecture
+For the full architecture, data flow, API reference, Windows notes, and glossary, see [PROJECT_GUIDE.md](./PROJECT_GUIDE.md).
 
-```
-Frontend (React.js) ←→ Backend API (Spring Boot) ←→ AI Service (Python/LangChain)
-       ↓                        ↓                          ↓
-  Tailwind CSS           MySQL Database              Vector Store (FAISS)
-```
+## Windows setup
 
-## ✨ Features
+Requirements:
+- Windows 10/11
+- Python 3.11
+- Node.js 18 or newer
+- [Ollama for Windows](https://ollama.com/download) (recommended for local, no-API-billing use)
 
-- **Multi-format Document Support**: PDF, Word (.docx), and Text files
-- **Advanced RAG Architecture**: Uses LangChain + OpenAI embeddings
-- **Vector Database**: FAISS for fast similarity search
-- **Modern UI**: React with Tailwind CSS and responsive design
-- **Real-time Chat**: Interactive conversation interface
-- **Document Management**: Upload, process, and manage knowledge base
-- **Settings Dashboard**: Configure AI parameters and system settings
-- **Streamlit Admin**: Alternative testing interface included
+### 1. Configure the backend
 
-## 🛠️ Tech Stack
+Open Command Prompt in the project root:
 
-### Frontend
-- **React.js** with TypeScript
-- **Tailwind CSS** for styling
-- **Lucide React** for icons
-- **Vite** for fast development
-
-### Backend API (To Implement)
-- **Spring Boot** for robust API
-- **MySQL** for structured data storage
-- **RESTful endpoints** for frontend communication
-
-### AI Layer (Implemented)
-- **Python** with LangChain framework
-- **OpenAI GPT-4** for language generation
-- **FAISS** vector database for embeddings
-- **Document processors** for PDF, DOCX, TXT
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Node.js 18+
-- Python 3.8+
-- OpenAI API key
-
-### 1. Frontend Setup (Already Running)
-```bash
-npm install
-npm run dev  # Runs on http://localhost:5173
-```
-
-### 2. Python RAG Service Setup
-```bash
+```bat
 cd backend
+copy .env.example .env
+```
+
+The default provider is Ollama. Install Ollama, then open a separate Command Prompt and download the default local models:
+
+```bat
+ollama pull qwen2.5:3b
+ollama pull nomic-embed-text
+```
+
+Ollama should be running at `http://localhost:11434`. You can verify it with:
+
+```bat
+ollama list
+```
+
+To store model files on another drive instead of the default user profile, set `OLLAMA_MODELS` before starting Ollama. For example, in PowerShell:
+
+```powershell
+[Environment]::SetEnvironmentVariable("OLLAMA_MODELS", "D:\OllamaModels", "User")
+```
+
+Restart Ollama after changing this variable.
+
+OpenAI remains optional. To use it instead, select **OpenAI API** in the Settings page and provide an API key with available API credits. ChatGPT subscriptions do not provide API credits.
+
+Create a virtual environment and install dependencies:
+
+```bat
+python -m venv venv
+venv\Scripts\activate.bat
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-
-# Set your OpenAI API key
-export OPENAI_API_KEY="your_api_key_here"
-
-# Run the Flask API
-python app.py  # Runs on http://localhost:5000
 ```
 
-### 3. Streamlit Testing Interface
-```bash
-# Alternative: Run Streamlit UI for testing
-chmod +x start-streamlit.sh
-./start-streamlit.sh  # Runs on http://localhost:8501
+Start the backend:
+
+```bat
+python app.py
 ```
 
-## 📋 API Endpoints
+The API will start at `http://localhost:5000`.
 
-The Python service provides these endpoints for integration:
+### 2. Start the frontend
 
-```
-POST /api/chat          - Send chat messages
-POST /api/upload        - Upload documents
-GET  /api/status        - System status
-```
+Open another Command Prompt in the project root:
 
-## 🔧 Configuration
-
-### Environment Variables
-```bash
-# Required
-OPENAI_API_KEY=your_openai_api_key
-
-# Optional (defaults provided)
-OPENAI_MODEL=gpt-4
-OPENAI_TEMPERATURE=0.7
-CHUNK_SIZE=1000
-CHUNK_OVERLAP=200
+```bat
+npm install
+npm run dev
 ```
 
-### Document Processing Settings
-- **Chunk Size**: 1000 characters (adjustable)
-- **Chunk Overlap**: 200 characters (adjustable)
-- **Supported Formats**: PDF, DOCX, TXT
-- **Max File Size**: 10MB
+Open `http://localhost:5173`.
 
-## 📖 Usage Guide
+## Supported workflow
 
-### 1. Upload Documents
-- Use the Document Management interface
-- Drag and drop or click to upload files
-- Documents are automatically processed and chunked
-- Vector embeddings are created and stored
+1. Upload PDF, DOCX, or TXT files from the Documents page.
+2. InfoFlow extracts text, creates overlapping chunks, generates local Ollama embeddings by default, and stores them in FAISS.
+3. Ask questions on the Chat page.
+4. The backend retrieves relevant chunks and sends them with the question to the selected local Ollama or OpenAI chat model.
+5. Answers include source document names and pages when available.
 
-### 2. Chat Interface
-- Ask questions about uploaded documents
-- Get contextual answers with source references
-- View conversation history
-- Sources are displayed with each response
+## Persistence
 
-### 3. Knowledge Base Management
-- View document statistics
-- Search through knowledge chunks
-- Reindex vector database when needed
-- Monitor system performance
+Backend state is stored under `backend\data`:
+- `infoflow.db` contains document metadata and application state.
+- `vector\index.faiss` contains the persistent FAISS index.
+- `vector\chunks.json` contains indexed chunk text and source metadata.
+- `uploads` contains preserved source files.
 
-## 🏭 Production Deployment
+Reindexing rebuilds the FAISS index from preserved source files.
+If you change the provider or embedding model, use **Reindex Knowledge Base** to rebuild vectors using the selected embedding model. Ollama and OpenAI indexes cannot be mixed.
 
-### Docker Compose (Recommended)
-```yaml
-version: '3.8'
-services:
-  frontend:
-    build: .
-    ports:
-      - "80:80"
-    environment:
-      - VITE_API_URL=http://api:8080
+## API endpoints
 
-  rag-service:
-    build: ./backend
-    ports:
-      - "5000:5000"
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    volumes:
-      - ./data:/app/data
-```
+- `GET /api/status`
+- `GET /api/documents`
+- `POST /api/upload`
+- `DELETE /api/documents/<id>`
+- `POST /api/chat`
+- `POST /api/search`
+- `GET /api/knowledge`
+- `POST /api/reindex`
+- `GET /api/export`
+- `GET /api/settings`
+- `POST /api/settings`
 
-### Cloud Platforms
-- **AWS**: ECS Fargate + RDS + S3
-- **Vercel**: Frontend deployment
-- **Railway**: Backend services
-- **Digital Ocean**: Full stack deployment
-
-## 🧪 Testing
-
-### Postman Collection
-Import the API collection for testing:
-```json
-{
-  "info": { "name": "InfoFlow AI API" },
-  "variable": [
-    { "key": "baseUrl", "value": "http://localhost:5000" }
-  ]
-}
-```
-
-### Test Scenarios
-1. **Document Upload**: Test various file formats
-2. **Chat Queries**: Verify RAG responses
-3. **Error Handling**: Invalid inputs and edge cases
-4. **Performance**: Large documents and concurrent requests
-
-## 🔒 Security Features
-
-- **API Key Management**: Secure OpenAI key handling
-- **File Validation**: Type and size restrictions
-- **Error Handling**: Graceful failure management
-- **CORS Configuration**: Secure cross-origin requests
-
-## 📊 Monitoring
-
-### System Metrics
-- Document processing status
-- Vector database size
-- Query response times
-- API usage statistics
-
-### Health Checks
-- OpenAI API connectivity
-- Vector database status
-- Document processor health
-- Memory and disk usage
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🆘 Troubleshooting
-
-### Common Issues
-
-**"OpenAI API key not found"**
-```bash
-export OPENAI_API_KEY="your_key_here"
-```
-
-**"Vector store not initialized"**
-- Upload at least one document first
-- Check file format support
-- Verify OpenAI API connectivity
-
-**"Port already in use"**
-```bash
-lsof -ti:5000 | xargs kill -9  # Kill process on port 5000
-```
-
-## 📞 Support
-
-For support and questions:
-- Check the integration guide: `integration-guide.md`
-- Review API documentation
-- Test with Streamlit interface first
-- Monitor logs for error details
-
----
-
-**InfoFlow AI** - Empowering enterprises with intelligent knowledge management through advanced RAG technology."# InflowAI" 
+Set `VITE_API_URL` before starting Vite only if the backend is hosted at an address other than `http://localhost:5000`.
