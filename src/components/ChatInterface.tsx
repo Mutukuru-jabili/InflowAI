@@ -1,11 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Send, Bot, User, Loader2 } from 'lucide-react';
+import { apiRequest } from '../api';
 
 interface Message {
   id: string;
   content: string;
   sender: 'user' | 'assistant';
   timestamp: Date;
+  sources?: ChatSource[];
+}
+
+interface ChatSource {
+  content: string;
+  source: string;
+  page: number | null;
+  similarity: number;
 }
 
 export function ChatInterface() {
@@ -43,21 +52,34 @@ export function ChatInterface() {
     setInputValue('');
     setIsLoading(true);
 
-    // Simulate API call to backend
+    const question = inputValue;
     try {
-      // In a real implementation, this would call your Spring Boot backend
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
+      const result = await apiRequest<{
+        answer: string;
+        sources?: ChatSource[];
+        error?: string;
+      }>('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: question }),
+      });
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
-        content: `I understand you're asking about "${inputValue}". Based on the documents in your knowledge base, I can provide relevant information. This would be the AI-generated response using RAG architecture.`,
+        content: result.answer,
         sender: 'assistant',
         timestamp: new Date(),
+        sources: result.sources,
       };
 
       setMessages(prev => [...prev, assistantMessage]);
     } catch (error) {
       console.error('Error sending message:', error);
+      setMessages(prev => [...prev, {
+        id: (Date.now() + 1).toString(),
+        content: error instanceof Error ? error.message : 'Could not reach the backend.',
+        sender: 'assistant',
+        timestamp: new Date(),
+      }]);
     } finally {
       setIsLoading(false);
     }
@@ -104,6 +126,15 @@ export function ChatInterface() {
                 } ${message.sender === 'user' ? 'rounded-br-md' : 'rounded-bl-md'}`}>
                   <p className="text-sm leading-relaxed">{message.content}</p>
                 </div>
+                {message.sources && message.sources.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {message.sources.map((source, index) => (
+                      <p key={`${source.source}-${index}`} className="text-xs text-gray-500">
+                        Source: {source.source}{source.page ? ` (page ${source.page})` : ''}
+                      </p>
+                    ))}
+                  </div>
+                )}
                 <p className={`text-xs text-gray-500 mt-1 ${
                   message.sender === 'user' ? 'text-right' : ''
                 }`}>
